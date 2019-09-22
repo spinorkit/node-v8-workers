@@ -359,7 +359,7 @@ void mutate(Isolate * isolate) {
       }
    }
 
-void enterIso0FromOrdinaryThread(const FunctionCallbackInfo<Value>& args)
+void enterIsoFromOrdinaryThread(const FunctionCallbackInfo<Value>& args)
    {
    //First spin up an ordinary thread with a task queue if none present
    std::call_once(gInitOrdinaryThread, []()
@@ -418,44 +418,46 @@ void enterIso0FromOrdinaryThread(const FunctionCallbackInfo<Value>& args)
       script = *str;
       }
 
+   int32_t workerIndex = 0;
+   if (args[1]->IsInt32())
+      workerIndex = args[1]->Int32Value(isolate->GetCurrentContext()).FromMaybe(0);
+
    //Queue a lambda function to run the script on an Isolate grabbed from a worker thread
-   gOrdinaryThreads.QueueActionOnOrdinaryThread(WorkerAction([script](ThreadInfo *info)
+   gOrdinaryThreads.QueueActionOnOrdinaryThread(WorkerAction([script, workerIndex](ThreadInfo *info)
       {
       std::ostringstream os;
       os << "throw Error('Exception from isolate " << info->mIndex << " on thread " << std::this_thread::get_id() << "');" << std::endl;
 
-      auto isolate = Isolate::GetCurrent();
-
-      //Enter isolate 0
-      auto worker0 = gWebWorkers.at(0);
-      auto isolate0 = worker0->mIsolate;
+      //Enter isolate borrowed from a worker
+      auto worker = gWebWorkers.at(workerIndex);
+      Isolate *isolate = worker->mIsolate;
          { //Do some JS work
-         Locker locker(isolate0); //This will block if isolate0 is busy!
+         Locker locker(isolate); //This will block if isolate0 is busy!
          auto t1 = high_resolution_clock::now();
-         Isolate::Scope isoScope(isolate0); //Enter Isolate.
-         v8::HandleScope handleScope(isolate0);
-         auto context = Local<Context>::New(isolate0, worker0->mContext);
+         Isolate::Scope isoScope(isolate); //Enter Isolate.
+         v8::HandleScope handleScope(isolate);
+         auto context = Local<Context>::New(isolate, worker->mContext);
          v8::Context::Scope context_scope{ context };
          auto t2 = high_resolution_clock::now();
          auto switchTime = duration_cast<duration<double>>(t2 - t1);
 
-         TryCatch tryCatch(isolate0);
+         TryCatch tryCatch(isolate);
 
          auto result = ADI::CompileRun(script.c_str());
          if (!result.IsEmpty() && result->IsString())
             {
-            v8::String::Utf8Value msg(isolate0, result->ToString(isolate0));
-            std::cout<<*msg<<std::endl;
+            v8::String::Utf8Value msg(isolate, result->ToString(isolate));
+            std::cout << "Iso" << worker->mIndex << ": " <<*msg<<std::endl;
             }
 
          if (tryCatch.HasCaught())
             {
-            v8::String::Utf8Value msg(isolate0, tryCatch.Message()->Get());
-            std::cerr << *msg << std::endl;
+            v8::String::Utf8Value msg(isolate, tryCatch.Message()->Get());
+            std::cerr << "Iso" << worker->mIndex << ": " << *msg << std::endl;
             }
 
          std::ostringstream os;
-         os << "Entering isolate (" << worker0->mIndex << ") on std::thread " << std::this_thread::get_id() << " took " << switchTime.count() << "secs." << std::endl;
+         os << "Entering isolate (" << worker->mIndex << ") on std::thread " << std::this_thread::get_id() << " took " << switchTime.count() << "secs." << std::endl;
          std::cout << os.str() << std::endl;
 
          }
@@ -574,14 +576,19 @@ void queWorkerAction(const FunctionCallbackInfo<Value> &args)
          if (result.ToLocal(&resultStr) && resultStr->IsString())
             {
             v8::String::Utf8Value msg(isolate, resultStr->ToString(isolate));
-            std::cout << *msg << std::endl;
+            std::cout << "Iso"<<info->mIndex<<": "<<*msg << std::endl;
             }
 
+         bool failed = false;
          if (tryCatch.HasCaught())
             {
+            failed = true;
             v8::String::Utf8Value msg(isolate, tryCatch.Message()->Get());
-            std::cerr << *msg << std::endl;
+            std::cerr << "Iso" << info->mIndex << ": " << *msg << std::endl;
             }
+
+         if(!failed)
+            return;
          //Now run in other Isolate but still on this thread
          auto otherWorker = gWebWorkers.at(1 - info->mIndex);
          if (otherWorker)
@@ -589,45 +596,43 @@ void queWorkerAction(const FunctionCallbackInfo<Value> &args)
             auto t1 = high_resolution_clock::now();
             isolate->Exit();
             auto otherIso = otherWorker->mIsolate;
-            {
-            v8::Unlocker unlocker(isolate);
                {
-               Locker locker(otherIso);
-               otherIso->Enter();
-               v8::HandleScope handleScope(otherIso);
-
-               //auto context = isolate->GetCurrentContext();
-               auto context = Local<Context>::New(otherIso, otherWorker->mContext);
-               v8::Context::Scope context_scope{ context };
-
-               auto t2 = high_resolution_clock::now();
-               auto switchTime = duration_cast<duration<double>>(t2 - t1);
-
-
-               TryCatch tryCatch(otherIso);
-
-               std::cout << "\nSwitching to other isolate (" << otherWorker->mIndex << ") on thread " << std::this_thread::get_id() << ". Switch took " << switchTime.count() << "secs." << std::endl;
-
-               auto result = ADI::CompileRun(script.c_str());
-               if (!result.IsEmpty() && result->IsString())
+               v8::Unlocker unlocker(isolate);
                   {
-                  v8::String::Utf8Value msg(otherIso, result->ToString(otherIso));
-                  std::cout << *msg << std::endl;
-                  }
+                  Locker locker(otherIso);
+                  Isolate::Scope isoScope(otherIso); //Enter Isolate.
 
-               if (tryCatch.HasCaught())
-                  {
-                  v8::String::Utf8Value msg(otherIso, tryCatch.Message()->Get());
-                  std::cerr << *msg << std::endl;
+                  v8::HandleScope handleScope(otherIso);
+
+                  //auto context = isolate->GetCurrentContext();
+                  auto context = Local<Context>::New(otherIso, otherWorker->mContext);
+                  v8::Context::Scope context_scope{ context };
+
+                  auto t2 = high_resolution_clock::now();
+                  auto switchTime = duration_cast<duration<double>>(t2 - t1);
+
+                  std::cout << "Switching to other isolate (" << otherWorker->mIndex << ") on thread " << std::this_thread::get_id() << ". Switch took " << switchTime.count() << "secs." << std::endl;
+
+                  TryCatch tryCatch(otherIso);
+
+                  auto result = ADI::CompileRun(script.c_str());
+                  if (!result.IsEmpty() && result->IsString())
+                     {
+                     v8::String::Utf8Value msg(otherIso, result->ToString(otherIso));
+                     std::cout << "Iso" << otherWorker->mIndex << ": " << *msg << std::endl;
+                     }
+
+                  if (tryCatch.HasCaught())
+                     {
+                     v8::String::Utf8Value msg(otherIso, tryCatch.Message()->Get());
+                     std::cerr << "Iso" << otherWorker->mIndex << ": " << *msg << std::endl;
+                     }
                   }
                }
-            }
             // now that the unlocker is destroyed, re-enter original worker's isolate
             isolate->Enter();
             }
          }
-      //ADI::CompileRun(os.str().c_str());
-      //ADI::CompileRun(script.c_str());
       }, nullptr), nullptr);
 
    }
@@ -639,5 +644,5 @@ NODE_MODULE_INIT()
    NODE_SET_METHOD(exports, "onWorkerStart", onWorkerStart);
    NODE_SET_METHOD(exports, "waitForTask", waitForTask);
    NODE_SET_METHOD(exports, "queWorkerAction", queWorkerAction);
-   NODE_SET_METHOD(exports, "enterIso0FromOrdinaryThread", enterIso0FromOrdinaryThread);
+   NODE_SET_METHOD(exports, "enterIsoFromOrdinaryThread", enterIsoFromOrdinaryThread);
    }
