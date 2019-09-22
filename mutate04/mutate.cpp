@@ -427,11 +427,10 @@ void enterIso0FromOrdinaryThread(const FunctionCallbackInfo<Value>& args)
       //Enter isolate 0
       auto worker0 = gWebWorkers.at(0);
       auto isolate0 = worker0->mIsolate;
-         {
-
-         Locker locker(isolate0);
+         { //Do some JS work
+         Locker locker(isolate0); //This will block if isolate0 is busy!
          auto t1 = high_resolution_clock::now();
-         isolate0->Enter();
+         Isolate::Scope isoScope(isolate0); //Enter Isolate.
          v8::HandleScope handleScope(isolate0);
          auto context = Local<Context>::New(isolate0, worker0->mContext);
          v8::Context::Scope context_scope{ context };
@@ -440,10 +439,12 @@ void enterIso0FromOrdinaryThread(const FunctionCallbackInfo<Value>& args)
 
          TryCatch tryCatch(isolate0);
 
-         std::ostringstream os;
-         os << "throw Error('Exception from isolate (" << worker0->mIndex << ") on thread " << std::this_thread::get_id() << ". Switch took " << switchTime.count() << "secs ');" << std::endl;
-
-         ADI::CompileRun(os.str().c_str());
+         auto result = ADI::CompileRun(script.c_str());
+         if (!result.IsEmpty() && result->IsString())
+            {
+            v8::String::Utf8Value msg(isolate0, result->ToString(isolate0));
+            std::cout<<*msg<<std::endl;
+            }
 
          if (tryCatch.HasCaught())
             {
@@ -451,25 +452,11 @@ void enterIso0FromOrdinaryThread(const FunctionCallbackInfo<Value>& args)
             std::cerr << *msg << std::endl;
             }
 
+         std::ostringstream os;
+         os << "Entering isolate (" << worker0->mIndex << ") on std::thread " << std::this_thread::get_id() << " took " << switchTime.count() << "secs." << std::endl;
+         std::cout << os.str() << std::endl;
+
          }
-
-
-
-      //auto scriptJs = ADI::v8_compile(os.str().c_str());
-      //if (!scriptJs.IsEmpty())
-      //   {
-      //   TryCatch tryCatch(isolate);
-
-      //   auto result = scriptJs->Run(isolate->GetCurrentContext());
-
-      //   if (tryCatch.HasCaught())
-      //      {
-      //      v8::String::Utf8Value msg(isolate, tryCatch.Message()->Get());
-      //      std::cerr << *msg << std::endl;
-      //      }
-      //   }
-
-
       }, nullptr));
    }
 
@@ -494,24 +481,24 @@ void enterIso0(const FunctionCallbackInfo<Value>& args)
       Isolate *isolate0 = threadInfo->mIsolate;
       Locker locker0(isolate0);
       isolate0->Enter();
-      {
-      v8::HandleScope handleScope(isolate0);
-
-      //auto context = isolate->GetCurrentContext();
-      auto context = Local<Context>::New(isolate, threadInfo->mContext);
-      v8::Context::Scope context_scope{ context };
-
-      TryCatch tryCatch(isolate0);
-
-      ADI::CompileRun(script.c_str());
-
-      if (tryCatch.HasCaught())
          {
-         v8::String::Utf8Value msg(isolate, tryCatch.Message()->Get());
-         std::cerr << *msg << std::endl;
-         }
+         v8::HandleScope handleScope(isolate0);
 
-      }
+         //auto context = isolate->GetCurrentContext();
+         auto context = Local<Context>::New(isolate, threadInfo->mContext);
+         v8::Context::Scope context_scope{ context };
+
+         TryCatch tryCatch(isolate0);
+
+         ADI::CompileRun(script.c_str());
+
+         if (tryCatch.HasCaught())
+            {
+            v8::String::Utf8Value msg(isolate, tryCatch.Message()->Get());
+            std::cerr << *msg << std::endl;
+            }
+
+         }
       }
    }
    // now that the unlocker is destroyed, re-enter.

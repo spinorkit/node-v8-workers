@@ -25,6 +25,12 @@ function findPrimes(fromNumber, toNumber) {
   return primes;
 }
 
+function doWork () {
+  return `The sqrt of 2 is ${Math.sqrt(2)} `;
+}
+
+const doWorkStr = doWork.toString() + 'doWork()';
+
 if (isMainThread) {
   // This re-loads the current file inside a Worker instance.
   debugger;
@@ -38,9 +44,9 @@ setInterval( () => {
   //addon.let_worker_work();
   //addon.enterIso0("console.log('Entered Iso0 from main thread');");
   //addon.enterIso0("throw Error('Exception from Iso0!');");
-  addon.queWorkerAction("throw Error('Exception from worker!');")
-  addon.enterIso0FromOrdinaryThread("throw Error('Exception from worker!');")
-	console.log(obj)
+  //addon.queWorkerAction("throw Error('Exception from worker!');")
+  addon.enterIso0FromOrdinaryThread(doWorkStr);
+	//console.log(obj)
 }, 1000);
 
   new Worker(__filename);
