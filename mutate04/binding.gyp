@@ -2,6 +2,9 @@
   "targets": [
     {
       "target_name": "mutate",
+      "include_dirs" : [
+        "<!(node -e \"require('nan')\")"
+        ],
       "sources": [ "mutate.cpp" ],
       "cflags": ["-Wall", "-std=c++11"],
       "conditions": [
