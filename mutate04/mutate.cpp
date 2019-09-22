@@ -1,4 +1,5 @@
-#include <node.h>
+//#include <node.h>
+#include <nan.h>
 #include <chrono>
 #include <thread>
 #include <iostream>
@@ -63,15 +64,16 @@ class WorkerAction
 
 struct ThreadInfo
    {
-   ThreadInfo(Isolate *isolate):
+   ThreadInfo(Isolate *isolate) :
       mThreadId(std::this_thread::get_id()),
       mIsolate(isolate),
-      mContext(isolate, isolate->GetCurrentContext()),
+      //mContext(isolate, isolate->GetCurrentContext()),
       mIsWaiting(false),
       mRecentlyUsed(false),
       mIndex(-1)
       {
-
+      if(isolate)
+         mContext.Reset(isolate, isolate->GetCurrentContext());
       }
 
    //Returns true if waiting or recently used flag is not set.
@@ -101,13 +103,13 @@ struct ThreadInfo
 
    bool Wake()
       {
-         {
-         std::lock_guard<std::mutex> lock(mMutex);
-         SetWaiting(false);
-         //CreateInterThreadNotifierIfNeeded();
-         }
-      mCondition.notify_one();
-      return true;
+            {
+            std::lock_guard<std::mutex> lock(mMutex);
+            SetWaiting(false);
+            //CreateInterThreadNotifierIfNeeded();
+            }
+            mCondition.notify_one();
+            return true;
       }
 
 
@@ -255,6 +257,38 @@ class WebWorkerThreads
             webWorker->Wake();
          }
 
+      void QueueActionOnOrdinaryThread(WorkerAction &&action)
+         {
+         ThreadInfo* webWorker = nullptr;
+
+         //Has no preferred thread (probably a new or changed calculation).
+         //Find a thread with an empty queue. Prefer least recently used thread.
+         uint32_t nWorkers = mNWorkers;
+         uint32_t nToCheck = 2 * nWorkers;
+         //Note: ShouldBeUsed() resets the recently used flag
+         for (uint32_t i = 0; !mVector[mRover]->ShouldBeUsed() && i < nToCheck; ++i)
+            if (++mRover >= nWorkers)
+               mRover = 0;
+         webWorker = mVector[mRover].get();
+#ifdef ADIDEBUG
+         mUseCount[mRover]++;
+#endif
+         if (!webWorker)
+            {
+            ADIASSERT(0);
+            //if (!mNWorkers)
+            //   Nan::ThrowError("Quark: No web worker threads present.");
+            //else
+            //   Nan::ThrowError("Quark: Unexpected web worker thread id");
+            return;
+            }
+         webWorker->push(std::move(action));
+
+         if (webWorker->IsWaiting())
+            webWorker->Wake();
+         }
+
+
       ThreadInfo *at(uint32_t i)
          {
          if (i < mVector.size())
@@ -278,18 +312,22 @@ typedef WebWorkerThreads TWorkerThreads;
 
 WebWorkerThreads gWebWorkers;
 
+std::once_flag gInitOrdinaryThread;
+static std::unique_ptr<std::thread> gAnOrdinaryThread;
+
+TWorkerThreads gOrdinaryThreads;
 
 void mutate(Isolate * isolate) {
-	while (true) 
+   while (true)
       {
       std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
-		std::cerr << "Worker thread trying to enter isolate" << std::endl;
-		v8::Locker locker(isolate);
-		isolate->Enter();
-		std::cerr << "Worker thread has entered isolate" << std::endl;
-    // we need this to create local handles, since this
-    // function is NOT called by Node.js
+      std::cerr << "Worker thread trying to enter isolate" << std::endl;
+      v8::Locker locker(isolate);
+      isolate->Enter();
+      std::cerr << "Worker thread has entered isolate" << std::endl;
+      // we need this to create local handles, since this
+      // function is NOT called by Node.js
       {
       v8::HandleScope handleScope(isolate);
 
@@ -311,17 +349,128 @@ void mutate(Isolate * isolate) {
             }
          }
       }
- 
-   isolate->Exit();
 
-		// Note, the locker will go out of scope here, so the thread
-		// will leave the isolate (release the lock)
+      isolate->Exit();
+
+      // Note, the locker will go out of scope here, so the thread
+      // will leave the isolate (release the lock)
+      }
    }
-}
 
-void enterIso1FromIso0(const FunctionCallbackInfo<Value>& args)
+void enterIso0FromOrdinaryThread(const FunctionCallbackInfo<Value>& args)
    {
+   //First spin up an ordinary thread with a task queue if none present
+   std::call_once(gInitOrdinaryThread, []()
+      {
+      ThreadInfo *ordinaryWorker = nullptr;
+      gAnOrdinaryThread.reset(new thread([]()
+         {
+         auto ordinaryWorker = std::make_unique<ThreadInfo>(/*isolate*/nullptr);
+         auto ordinaryWorkerWeak = ordinaryWorker.get();
+         gOrdinaryThreads.Add(std::move(ordinaryWorker));
 
+         //wait for work
+         for (;;)
+            {
+            ordinaryWorkerWeak->Wait();
+            WorkerAction action;
+            while (ordinaryWorkerWeak->mWorkerActionQueue.try_pop(action))
+               {
+                     {
+                     //std::unique_lock<std::mutex> lock(mMutex);
+                     ordinaryWorkerWeak->SetWaiting(false);
+                     ordinaryWorkerWeak->SetRecentlyUsed(); //We are doing real work
+                     }
+
+                     try
+                        {
+                        if (action.mInWorkerFunc)
+                           action.mInWorkerFunc(ordinaryWorkerWeak);
+                        }
+                     catch (std::exception& err)
+                        {
+                        //action.setLastError(err);
+                        }
+
+                     //if (workerPtr->mInterThreadNotifier)
+                     //   {
+                     //   workerPtr->mInterThreadNotifier->PostNotification([action]()
+                     //      {
+                     //      if (action.mInMainFunc)
+                     //         action.mInMainFunc();
+                     //      });
+                     //   }
+               }
+
+            }
+         }));
+      std::cout << "Started ordinary thread: "<< std::this_thread::get_id() << std::endl;
+      });
+
+   Isolate * isolate = args.GetIsolate();
+   std::string script;
+   v8::HandleScope handleScope(isolate);
+   if (args[0]->IsString())
+      {
+      v8::String::Utf8Value str(isolate, args[0]);
+      script = *str;
+      }
+
+
+   gOrdinaryThreads.QueueActionOnOrdinaryThread(WorkerAction([script](ThreadInfo *info)
+      {
+      std::ostringstream os;
+      os << "throw Error('Exception from isolate " << info->mIndex << " on thread " << std::this_thread::get_id() << "');" << std::endl;
+
+      auto isolate = Isolate::GetCurrent();
+
+      //Enter isolate 0
+      auto worker0 = gWebWorkers.at(0);
+      auto isolate0 = worker0->mIsolate;
+         {
+
+         Locker locker(isolate0);
+         auto t1 = high_resolution_clock::now();
+         isolate0->Enter();
+         v8::HandleScope handleScope(isolate0);
+         auto context = Local<Context>::New(isolate0, worker0->mContext);
+         v8::Context::Scope context_scope{ context };
+         auto t2 = high_resolution_clock::now();
+         auto switchTime = duration_cast<duration<double>>(t2 - t1);
+
+         TryCatch tryCatch(isolate0);
+
+         std::ostringstream os;
+         os << "throw Error('Exception from isolate (" << worker0->mIndex << ") on thread " << std::this_thread::get_id() << ". Switch took " << switchTime.count() << "secs ');" << std::endl;
+
+         ADI::CompileRun(os.str().c_str());
+
+         if (tryCatch.HasCaught())
+            {
+            v8::String::Utf8Value msg(isolate0, tryCatch.Message()->Get());
+            std::cerr << *msg << std::endl;
+            }
+
+         }
+
+
+
+      //auto scriptJs = ADI::v8_compile(os.str().c_str());
+      //if (!scriptJs.IsEmpty())
+      //   {
+      //   TryCatch tryCatch(isolate);
+
+      //   auto result = scriptJs->Run(isolate->GetCurrentContext());
+
+      //   if (tryCatch.HasCaught())
+      //      {
+      //      v8::String::Utf8Value msg(isolate, tryCatch.Message()->Get());
+      //      std::cerr << *msg << std::endl;
+      //      }
+      //   }
+
+
+      }, nullptr));
    }
 
 void enterIso0(const FunctionCallbackInfo<Value>& args)
@@ -337,34 +486,34 @@ void enterIso0(const FunctionCallbackInfo<Value>& args)
       }
    }
    isolate->Exit();
+   {
+   v8::Unlocker unlocker(isolate);
+   auto threadInfo = gWebWorkers.at(0);
+   if (threadInfo)
       {
-      v8::Unlocker unlocker(isolate);
-      auto threadInfo = gWebWorkers.at(0);
-      if (threadInfo)
+      Isolate *isolate0 = threadInfo->mIsolate;
+      Locker locker0(isolate0);
+      isolate0->Enter();
+      {
+      v8::HandleScope handleScope(isolate0);
+
+      //auto context = isolate->GetCurrentContext();
+      auto context = Local<Context>::New(isolate, threadInfo->mContext);
+      v8::Context::Scope context_scope{ context };
+
+      TryCatch tryCatch(isolate0);
+
+      ADI::CompileRun(script.c_str());
+
+      if (tryCatch.HasCaught())
          {
-         Isolate *isolate0 = threadInfo->mIsolate;
-         Locker locker0(isolate0);
-         isolate0->Enter();
-            {
-            v8::HandleScope handleScope(isolate0);
-
-            //auto context = isolate->GetCurrentContext();
-            auto context = Local<Context>::New(isolate, threadInfo->mContext);
-            v8::Context::Scope context_scope{ context };
-
-            TryCatch tryCatch(isolate0);
-
-            ADI::CompileRun(script.c_str());
-
-            if (tryCatch.HasCaught())
-               {
-               v8::String::Utf8Value msg(isolate, tryCatch.Message()->Get());
-               std::cerr << *msg << std::endl;
-               }
-
-            }
+         v8::String::Utf8Value msg(isolate, tryCatch.Message()->Get());
+         std::cerr << *msg << std::endl;
          }
+
       }
+      }
+   }
    // now that the unlocker is destroyed, re-enter.
    isolate->Enter();
    }
@@ -372,32 +521,32 @@ void enterIso0(const FunctionCallbackInfo<Value>& args)
 
 
 void Start(const FunctionCallbackInfo<Value>& args) {
-	Isolate * isolate = args.GetIsolate();
+   Isolate * isolate = args.GetIsolate();
 
    bool lockerActive = Locker::IsActive();
    bool locked = Locker::IsLocked(isolate);
 
-  persist.Reset(isolate, args[0]->ToObject(isolate));
+   persist.Reset(isolate, args[0]->ToObject(isolate));
 
-  gContext.Reset(isolate, isolate->GetCurrentContext());
+   gContext.Reset(isolate, isolate->GetCurrentContext());
 
-  // spawn a new worker thread to modify the target object
-  std::thread t(mutate, isolate);
-	t.detach();
-}
+   // spawn a new worker thread to modify the target object
+   std::thread t(mutate, isolate);
+   t.detach();
+   }
 
 void LetWorkerWork(const FunctionCallbackInfo<Value> &args) {
-	Isolate * isolate = args.GetIsolate();
-	{
-		isolate->Exit();
-  	v8::Unlocker unlocker(isolate);
+   Isolate * isolate = args.GetIsolate();
+   {
+   isolate->Exit();
+   v8::Unlocker unlocker(isolate);
 
-		// let worker execute for a second
-		std::this_thread::sleep_for(std::chrono::seconds(1));
-	}
-	// now that the unlocker is destroyed, re-enter.
-	isolate->Enter();
-}
+   // let worker execute for a second
+   std::this_thread::sleep_for(std::chrono::seconds(1));
+   }
+   // now that the unlocker is destroyed, re-enter.
+   isolate->Enter();
+   }
 
 void onWorkerStart(const FunctionCallbackInfo<Value> &args)
    {
@@ -422,19 +571,19 @@ void waitForTask(const FunctionCallbackInfo<Value> &args)
    if (!workerPtr)
       {
       //Nan::ThrowError("Quark: Unexpected web worker thread id");
-      std::cerr << "Quark: Unexpected web worker isolate" <<std::endl;
+      std::cerr << "Quark: Unexpected web worker isolate" << std::endl;
       ADIASSERT(0);
       return;
       }
 
-      {
-      isolate->Exit();
-      v8::Unlocker unlocker(isolate); //Let other threads use this isolate
+   {
+   isolate->Exit();
+   v8::Unlocker unlocker(isolate); //Let other threads use this isolate
 
-                                      // let worker execute for a second
-                                      //std::this_thread::sleep_for(std::chrono::seconds(1));
-      workerPtr->Wait();
-      }
+                                   // let worker execute for a second
+                                   //std::this_thread::sleep_for(std::chrono::seconds(1));
+   workerPtr->Wait();
+   }
    // now that the unlocker is destroyed, re-enter.
    isolate->Enter();
    bool locked = Locker::IsLocked(isolate);
@@ -453,30 +602,30 @@ void waitForTask(const FunctionCallbackInfo<Value> &args)
    WorkerAction action;
    while (workerPtr->mWorkerActionQueue.try_pop(action))
       {
-         {
-         //std::unique_lock<std::mutex> lock(mMutex);
-         workerPtr->SetWaiting(false);
-         workerPtr->SetRecentlyUsed(); //We are doing real work
-         }
+            {
+            //std::unique_lock<std::mutex> lock(mMutex);
+            workerPtr->SetWaiting(false);
+            workerPtr->SetRecentlyUsed(); //We are doing real work
+            }
 
-      try
-         {
-         if (action.mInWorkerFunc)
-            action.mInWorkerFunc(workerPtr);
-         }
-      catch (std::exception& err)
-         {
-         //action.setLastError(err);
-         }
+            try
+               {
+               if (action.mInWorkerFunc)
+                  action.mInWorkerFunc(workerPtr);
+               }
+            catch (std::exception& err)
+               {
+               //action.setLastError(err);
+               }
 
-      //if (workerPtr->mInterThreadNotifier)
-      //   {
-      //   workerPtr->mInterThreadNotifier->PostNotification([action]()
-      //      {
-      //      if (action.mInMainFunc)
-      //         action.mInMainFunc();
-      //      });
-      //   }
+            //if (workerPtr->mInterThreadNotifier)
+            //   {
+            //   workerPtr->mInterThreadNotifier->PostNotification([action]()
+            //      {
+            //      if (action.mInMainFunc)
+            //         action.mInMainFunc();
+            //      });
+            //   }
       }
    }
 
@@ -521,32 +670,32 @@ void queWorkerAction(const FunctionCallbackInfo<Value> &args)
             auto otherIso = otherWorker->mIsolate;
             {
             v8::Unlocker unlocker(isolate);
+            {
+            Locker locker(otherIso);
+            otherIso->Enter();
+            v8::HandleScope handleScope(otherIso);
+
+            //auto context = isolate->GetCurrentContext();
+            auto context = Local<Context>::New(otherIso, otherWorker->mContext);
+            v8::Context::Scope context_scope{ context };
+
+            auto t2 = high_resolution_clock::now();
+            auto switchTime = duration_cast<duration<double>>(t2 - t1);
+
+
+            TryCatch tryCatch(otherIso);
+
+            std::ostringstream os;
+            os << "throw Error('Exception from other isolate (" << otherWorker->mIndex << ") on thread " << std::this_thread::get_id() << ". Switch took " << switchTime.count() << "secs ');" << std::endl;
+
+            ADI::CompileRun(os.str().c_str());
+
+            if (tryCatch.HasCaught())
                {
-               Locker locker(otherIso);
-               otherIso->Enter();
-               v8::HandleScope handleScope(otherIso);
-
-               //auto context = isolate->GetCurrentContext();
-               auto context = Local<Context>::New(otherIso, otherWorker->mContext);
-               v8::Context::Scope context_scope{ context };
-
-               auto t2 = high_resolution_clock::now();
-               auto switchTime = duration_cast<duration<double>>(t2 - t1);
-               
-
-               TryCatch tryCatch(otherIso);
-
-               std::ostringstream os;
-               os << "throw Error('Exception from other isolate (" << otherWorker->mIndex << ") on thread " << std::this_thread::get_id() << ". Switch took "<< switchTime.count() <<"secs ');" << std::endl;
-
-               ADI::CompileRun(os.str().c_str());
-
-               if (tryCatch.HasCaught())
-                  {
-                  v8::String::Utf8Value msg(otherIso, tryCatch.Message()->Get());
-                  std::cerr << *msg << std::endl;
-                  }
+               v8::String::Utf8Value msg(otherIso, tryCatch.Message()->Get());
+               std::cerr << *msg << std::endl;
                }
+            }
             }
             // now that the unlocker is destroyed, re-enter original worker's isolate
             isolate->Enter();
@@ -578,7 +727,7 @@ NODE_MODULE_INIT()
    NODE_SET_METHOD(exports, "let_worker_work", LetWorkerWork);
    NODE_SET_METHOD(exports, "onWorkerStart", onWorkerStart);
    NODE_SET_METHOD(exports, "waitForTask", waitForTask);
-   NODE_SET_METHOD(exports, "enterIso1FromIso0", enterIso1FromIso0);
+   NODE_SET_METHOD(exports, "enterIso0FromOrdinaryThread", enterIso0FromOrdinaryThread);
    NODE_SET_METHOD(exports, "enterIso0", enterIso0);
    NODE_SET_METHOD(exports, "queWorkerAction", queWorkerAction);
    }

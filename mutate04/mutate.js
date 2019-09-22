@@ -39,6 +39,7 @@ setInterval( () => {
   //addon.enterIso0("console.log('Entered Iso0 from main thread');");
   //addon.enterIso0("throw Error('Exception from Iso0!');");
   addon.queWorkerAction("throw Error('Exception from worker!');")
+  addon.enterIso0FromOrdinaryThread("throw Error('Exception from worker!');")
 	console.log(obj)
 }, 1000);
 
