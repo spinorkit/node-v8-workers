@@ -31,14 +31,11 @@ function doWork0(){
   return `Primes from 1 to 100 are: ${findPrimes(1,100)}`;
 }
 
-const doWork0Str = doWork0.toString() + 'doWork0()';
-
 
 function doWork1 () {
   return `The sqrt of 2 is ${Math.sqrt(2)} `;
 }
 
-const doWork1Str = doWork1.toString() + 'doWork1()';
 
 if (isMainThread) {
   // This re-loads the current file inside a Worker instance.
@@ -70,8 +67,8 @@ setInterval( () => {
   //addon.enterIso0FromOrdinaryThread(findPrimes.toString());
 } else {
   const addon = require('./build/Debug/mutate');
-  addon.onWorkerStart();
-  console.log('Inside Worker!');
+  const index = addon.onWorkerStart();
+  console.log(`Inside Worker ${index}!`);
   console.log(isMainThread);  // Prints 'false'.
   for(;;) {
     addon.waitForTask();

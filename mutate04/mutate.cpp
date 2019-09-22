@@ -23,6 +23,10 @@ using namespace std::chrono_literals;
 
 using namespace v8;
 
+using std::cout;
+using std::cerr;
+using std::endl;
+
 using std::atomic;
 using std::thread;
 using std::mutex;
@@ -441,6 +445,8 @@ void enterIsoFromOrdinaryThread(const FunctionCallbackInfo<Value>& args)
          auto t2 = high_resolution_clock::now();
          auto switchTime = duration_cast<duration<double>>(t2 - t1);
 
+         cout << "Entering isolate (" << worker->mIndex << ") on std::thread " << std::this_thread::get_id() << " took " << switchTime.count() << "secs." << endl;
+
          TryCatch tryCatch(isolate);
 
          auto result = ADI::CompileRun(script.c_str());
@@ -455,11 +461,6 @@ void enterIsoFromOrdinaryThread(const FunctionCallbackInfo<Value>& args)
             v8::String::Utf8Value msg(isolate, tryCatch.Message()->Get());
             std::cerr << "Iso" << worker->mIndex << ": " << *msg << std::endl;
             }
-
-         std::ostringstream os;
-         os << "Entering isolate (" << worker->mIndex << ") on std::thread " << std::this_thread::get_id() << " took " << switchTime.count() << "secs." << std::endl;
-         std::cout << os.str() << std::endl;
-
          }
       }, nullptr));
    }
