@@ -37,11 +37,13 @@ using Concurrency::concurrent_unordered_map;
 Persistent<Object> persist;
 v8::Persistent<v8::Context> gContext;
 
-typedef const std::function<void()> TWorkerFunc;
+//typedef const std::function<void()> TWorkerFunc;
 
 typedef std::thread::id TThreadKey;
 
 class ThreadInfo;
+
+static std::mutex gCoutMutex; //prevent garbled output on cout
 
 
 class WorkerAction
@@ -103,13 +105,13 @@ struct ThreadInfo
 
    bool Wake()
       {
-            {
-            std::lock_guard<std::mutex> lock(mMutex);
-            SetWaiting(false);
-            //CreateInterThreadNotifierIfNeeded();
-            }
-            mCondition.notify_one();
-            return true;
+         {
+         std::lock_guard<std::mutex> lock(mMutex);
+         SetWaiting(false);
+         //CreateInterThreadNotifierIfNeeded();
+         }
+      mCondition.notify_one();
+      return true;
       }
 
 
@@ -174,9 +176,9 @@ class WebWorkerThreads
          auto threadInfo = infoPtr.get();
          mVector.push_back(std::move(infoPtr));
          threadInfo->mIndex = mNWorkers++;
-#ifdef ADIDEBUG
+         #ifdef ADIDEBUG
          mUseCount.push_back(0);
-#endif
+         #endif
          return threadInfo->mIndex;
          }
 
@@ -187,9 +189,9 @@ class WebWorkerThreads
             ThreadInfo* aWebWorker = mVector[i].get();
             if (aWebWorker->mThreadId == threadId)
                {
-#ifdef ADIDEBUG
+               #ifdef ADIDEBUG
                mUseCount[i]++;
-#endif
+               #endif
                return aWebWorker;
                }
             }
@@ -203,9 +205,9 @@ class WebWorkerThreads
             ThreadInfo* aWebWorker = mVector[i].get();
             if (aWebWorker->mIsolate == isolate)
                {
-#ifdef ADIDEBUG
+               #ifdef ADIDEBUG
                mUseCount[i]++;
-#endif
+               #endif
                return aWebWorker;
                }
             }
@@ -232,9 +234,9 @@ class WebWorkerThreads
                if (++mRover >= nWorkers)
                   mRover = 0;
             webWorker = mVector[mRover].get();
-#ifdef ADIDEBUG
+            #ifdef ADIDEBUG
             mUseCount[mRover]++;
-#endif
+            #endif
             }
          else
             {
@@ -270,9 +272,9 @@ class WebWorkerThreads
             if (++mRover >= nWorkers)
                mRover = 0;
          webWorker = mVector[mRover].get();
-#ifdef ADIDEBUG
+         #ifdef ADIDEBUG
          mUseCount[mRover]++;
-#endif
+         #endif
          if (!webWorker)
             {
             ADIASSERT(0);
@@ -303,9 +305,9 @@ class WebWorkerThreads
       atomic<uint32_t> mRover;
       atomic<int> mInFlight;
 
-#ifdef ADIDEBUG
+      #ifdef ADIDEBUG
       std::vector<int> mUseCount; //Diagnostics only
-#endif
+      #endif
    };
 
 typedef WebWorkerThreads TWorkerThreads;
@@ -376,37 +378,37 @@ void enterIso0FromOrdinaryThread(const FunctionCallbackInfo<Value>& args)
             WorkerAction action;
             while (ordinaryWorkerWeak->mWorkerActionQueue.try_pop(action))
                {
-                     {
-                     //std::unique_lock<std::mutex> lock(mMutex);
-                     ordinaryWorkerWeak->SetWaiting(false);
-                     ordinaryWorkerWeak->SetRecentlyUsed(); //We are doing real work
-                     }
+                  {
+                  //std::unique_lock<std::mutex> lock(mMutex);
+                  ordinaryWorkerWeak->SetWaiting(false);
+                  ordinaryWorkerWeak->SetRecentlyUsed(); //We are doing real work
+                  }
 
-                     try
-                        {
-                        if (action.mInWorkerFunc)
-                           action.mInWorkerFunc(ordinaryWorkerWeak);
-                        }
-                     catch (std::exception& err)
-                        {
-                        //action.setLastError(err);
-                        }
+               try
+                  {
+                  if (action.mInWorkerFunc)
+                     action.mInWorkerFunc(ordinaryWorkerWeak);
+                  }
+               catch (std::exception& err)
+                  {
+                  //action.setLastError(err);
+                  }
 
-                     //if (workerPtr->mInterThreadNotifier)
-                     //   {
-                     //   workerPtr->mInterThreadNotifier->PostNotification([action]()
-                     //      {
-                     //      if (action.mInMainFunc)
-                     //         action.mInMainFunc();
-                     //      });
-                     //   }
+               //if (workerPtr->mInterThreadNotifier)
+               //   {
+               //   workerPtr->mInterThreadNotifier->PostNotification([action]()
+               //      {
+               //      if (action.mInMainFunc)
+               //         action.mInMainFunc();
+               //      });
+               //   }
                }
-
             }
          }));
       std::cout << "Started ordinary thread: "<< std::this_thread::get_id() << std::endl;
       });
 
+   //store the JS script string in c++ string.
    Isolate * isolate = args.GetIsolate();
    std::string script;
    v8::HandleScope handleScope(isolate);
@@ -416,7 +418,7 @@ void enterIso0FromOrdinaryThread(const FunctionCallbackInfo<Value>& args)
       script = *str;
       }
 
-
+   //Queue a lambda function to run the script on an Isolate grabbed from a worker thread
    gOrdinaryThreads.QueueActionOnOrdinaryThread(WorkerAction([script](ThreadInfo *info)
       {
       std::ostringstream os;
@@ -460,80 +462,6 @@ void enterIso0FromOrdinaryThread(const FunctionCallbackInfo<Value>& args)
       }, nullptr));
    }
 
-void enterIso0(const FunctionCallbackInfo<Value>& args)
-   {
-   Isolate * isolate = args.GetIsolate();
-   std::string script;
-   {
-   v8::HandleScope handleScope(isolate);
-   if (args[0]->IsString())
-      {
-      v8::String::Utf8Value str(isolate, args[0]);
-      script = *str;
-      }
-   }
-   isolate->Exit();
-   {
-   v8::Unlocker unlocker(isolate);
-   auto threadInfo = gWebWorkers.at(0);
-   if (threadInfo)
-      {
-      Isolate *isolate0 = threadInfo->mIsolate;
-      Locker locker0(isolate0);
-      isolate0->Enter();
-         {
-         v8::HandleScope handleScope(isolate0);
-
-         //auto context = isolate->GetCurrentContext();
-         auto context = Local<Context>::New(isolate, threadInfo->mContext);
-         v8::Context::Scope context_scope{ context };
-
-         TryCatch tryCatch(isolate0);
-
-         ADI::CompileRun(script.c_str());
-
-         if (tryCatch.HasCaught())
-            {
-            v8::String::Utf8Value msg(isolate, tryCatch.Message()->Get());
-            std::cerr << *msg << std::endl;
-            }
-
-         }
-      }
-   }
-   // now that the unlocker is destroyed, re-enter.
-   isolate->Enter();
-   }
-
-
-
-void Start(const FunctionCallbackInfo<Value>& args) {
-   Isolate * isolate = args.GetIsolate();
-
-   bool lockerActive = Locker::IsActive();
-   bool locked = Locker::IsLocked(isolate);
-
-   persist.Reset(isolate, args[0]->ToObject(isolate));
-
-   gContext.Reset(isolate, isolate->GetCurrentContext());
-
-   // spawn a new worker thread to modify the target object
-   std::thread t(mutate, isolate);
-   t.detach();
-   }
-
-void LetWorkerWork(const FunctionCallbackInfo<Value> &args) {
-   Isolate * isolate = args.GetIsolate();
-   {
-   isolate->Exit();
-   v8::Unlocker unlocker(isolate);
-
-   // let worker execute for a second
-   std::this_thread::sleep_for(std::chrono::seconds(1));
-   }
-   // now that the unlocker is destroyed, re-enter.
-   isolate->Enter();
-   }
 
 void onWorkerStart(const FunctionCallbackInfo<Value> &args)
    {
@@ -546,6 +474,9 @@ void onWorkerStart(const FunctionCallbackInfo<Value> &args)
 
    auto threadInfoPtr = std::make_unique<ThreadInfo>(isolate);
    uint32_t index = gWebWorkers.Add(std::move(threadInfoPtr));
+
+   std::lock_guard<mutex> lock(gCoutMutex);
+   std::cout <<"Worker "<<index <<" is thread "<<std::this_thread::get_id() << " and isolate "<<isolate<<std::endl;
 
    args.GetReturnValue().Set(Int32::New(isolate, index));
    }
@@ -589,30 +520,30 @@ void waitForTask(const FunctionCallbackInfo<Value> &args)
    WorkerAction action;
    while (workerPtr->mWorkerActionQueue.try_pop(action))
       {
-            {
-            //std::unique_lock<std::mutex> lock(mMutex);
-            workerPtr->SetWaiting(false);
-            workerPtr->SetRecentlyUsed(); //We are doing real work
-            }
+         {
+         //std::unique_lock<std::mutex> lock(mMutex);
+         workerPtr->SetWaiting(false);
+         workerPtr->SetRecentlyUsed(); //We are doing real work
+         }
 
-            try
-               {
-               if (action.mInWorkerFunc)
-                  action.mInWorkerFunc(workerPtr);
-               }
-            catch (std::exception& err)
-               {
-               //action.setLastError(err);
-               }
+      try
+         {
+         if (action.mInWorkerFunc)
+            action.mInWorkerFunc(workerPtr);
+         }
+      catch (std::exception& err)
+         {
+         //action.setLastError(err);
+         }
 
-            //if (workerPtr->mInterThreadNotifier)
-            //   {
-            //   workerPtr->mInterThreadNotifier->PostNotification([action]()
-            //      {
-            //      if (action.mInMainFunc)
-            //         action.mInMainFunc();
-            //      });
-            //   }
+      //if (workerPtr->mInterThreadNotifier)
+      //   {
+      //   workerPtr->mInterThreadNotifier->PostNotification([action]()
+      //      {
+      //      if (action.mInMainFunc)
+      //         action.mInMainFunc();
+      //      });
+      //   }
       }
    }
 
@@ -631,17 +562,20 @@ void queWorkerAction(const FunctionCallbackInfo<Value> &args)
 
    gWebWorkers.QueueAction(WorkerAction([script](ThreadInfo *info)
       {
-      std::ostringstream os;
-      os << "throw Error('Exception from isolate " << info->mIndex << " on thread " << std::this_thread::get_id() << "');" << std::endl;
-
       auto isolate = Isolate::GetCurrent();
 
-      auto scriptJs = ADI::v8_compile(os.str().c_str());
+      auto scriptJs = ADI::v8_compile(script.c_str());
       if (!scriptJs.IsEmpty())
          {
          TryCatch tryCatch(isolate);
 
          auto result = scriptJs->Run(isolate->GetCurrentContext());
+         Local<Value> resultStr;
+         if (result.ToLocal(&resultStr) && resultStr->IsString())
+            {
+            v8::String::Utf8Value msg(isolate, resultStr->ToString(isolate));
+            std::cout << *msg << std::endl;
+            }
 
          if (tryCatch.HasCaught())
             {
@@ -657,32 +591,36 @@ void queWorkerAction(const FunctionCallbackInfo<Value> &args)
             auto otherIso = otherWorker->mIsolate;
             {
             v8::Unlocker unlocker(isolate);
-            {
-            Locker locker(otherIso);
-            otherIso->Enter();
-            v8::HandleScope handleScope(otherIso);
-
-            //auto context = isolate->GetCurrentContext();
-            auto context = Local<Context>::New(otherIso, otherWorker->mContext);
-            v8::Context::Scope context_scope{ context };
-
-            auto t2 = high_resolution_clock::now();
-            auto switchTime = duration_cast<duration<double>>(t2 - t1);
-
-
-            TryCatch tryCatch(otherIso);
-
-            std::ostringstream os;
-            os << "throw Error('Exception from other isolate (" << otherWorker->mIndex << ") on thread " << std::this_thread::get_id() << ". Switch took " << switchTime.count() << "secs ');" << std::endl;
-
-            ADI::CompileRun(os.str().c_str());
-
-            if (tryCatch.HasCaught())
                {
-               v8::String::Utf8Value msg(otherIso, tryCatch.Message()->Get());
-               std::cerr << *msg << std::endl;
+               Locker locker(otherIso);
+               otherIso->Enter();
+               v8::HandleScope handleScope(otherIso);
+
+               //auto context = isolate->GetCurrentContext();
+               auto context = Local<Context>::New(otherIso, otherWorker->mContext);
+               v8::Context::Scope context_scope{ context };
+
+               auto t2 = high_resolution_clock::now();
+               auto switchTime = duration_cast<duration<double>>(t2 - t1);
+
+
+               TryCatch tryCatch(otherIso);
+
+               std::cout << "\nSwitching to other isolate (" << otherWorker->mIndex << ") on thread " << std::this_thread::get_id() << ". Switch took " << switchTime.count() << "secs." << std::endl;
+
+               auto result = ADI::CompileRun(script.c_str());
+               if (!result.IsEmpty() && result->IsString())
+                  {
+                  v8::String::Utf8Value msg(otherIso, result->ToString(otherIso));
+                  std::cout << *msg << std::endl;
+                  }
+
+               if (tryCatch.HasCaught())
+                  {
+                  v8::String::Utf8Value msg(otherIso, tryCatch.Message()->Get());
+                  std::cerr << *msg << std::endl;
+                  }
                }
-            }
             }
             // now that the unlocker is destroyed, re-enter original worker's isolate
             isolate->Enter();
@@ -695,26 +633,11 @@ void queWorkerAction(const FunctionCallbackInfo<Value> &args)
    }
 
 
-//void init(Local<Object> exports) {
-//  NODE_SET_METHOD(exports, "start", Start);
-//  NODE_SET_METHOD(exports, "waitForTask", waitForTask);
-//  NODE_SET_METHOD(exports, "onWorkerStart", onWorkerStart);
-//  NODE_SET_METHOD(exports, "enterIso1FromIso0", enterIso1FromIso0);
-//  
-//}
-
-//NODE_MODULE(mutate, init)
-//NODE_MODULE_CONTEXT_AWARE(mutate, init)
-
-
 NODE_MODULE_INIT()
    {
    //init
-   NODE_SET_METHOD(exports, "start", Start);
-   NODE_SET_METHOD(exports, "let_worker_work", LetWorkerWork);
    NODE_SET_METHOD(exports, "onWorkerStart", onWorkerStart);
    NODE_SET_METHOD(exports, "waitForTask", waitForTask);
-   NODE_SET_METHOD(exports, "enterIso0FromOrdinaryThread", enterIso0FromOrdinaryThread);
-   NODE_SET_METHOD(exports, "enterIso0", enterIso0);
    NODE_SET_METHOD(exports, "queWorkerAction", queWorkerAction);
+   NODE_SET_METHOD(exports, "enterIso0FromOrdinaryThread", enterIso0FromOrdinaryThread);
    }
